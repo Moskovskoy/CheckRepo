@@ -13,8 +13,6 @@ public final class Main {
     public static void main(String[] args) {
         LOG.debug("Аргументы запуска: {}", String.join(" ", args));
 
-        // TODO: разобрать аргументы и запустить анализ.
-        System.out.println("Incident Radar — шаблон проекта Т-Академии.");
-        System.out.println("Ничего ещё не реализовано. Начни с README.");
+        System.exit(App.run(args));
     }
 }

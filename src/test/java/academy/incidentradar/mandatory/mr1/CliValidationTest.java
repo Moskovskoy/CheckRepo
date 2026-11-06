@@ -1,8 +1,8 @@
 package academy.incidentradar.mandatory.mr1;
 
-import static org.junit.jupiter.api.Assertions.fail;
+import static org.assertj.core.api.Assertions.assertThat;
 
-import org.junit.jupiter.api.Disabled;
+import academy.incidentradar.App;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -13,38 +13,67 @@ import org.junit.jupiter.params.provider.ValueSource;
 class CliValidationTest {
 
     @Test
-    @Disabled("MR1: реализуй тест и удали эту строку")
     @DisplayName("Не передан обязательный --path -> exit code 2")
-    void missingPathExitsWithTwo() {
-        fail("Тест не реализован");
+    void missingPathReturnsExitCode2() {
+        int exitCode = App.run(new String[] {
+            "--output-format", "json",
+            "--output-path", "report.json"
+        });
+
+        assertThat(exitCode).isEqualTo(2);
     }
 
     @ParameterizedTest
     @ValueSource(strings = {"xml", "csv", "txt"})
-    @Disabled("MR1: реализуй тест и удали эту строку")
     @DisplayName("Неподдерживаемый --output-format \"{0}\" -> exit code 2")
     void unsupportedOutputFormatExitsWithTwo(String format) {
-        fail("Тест не реализован");
+        int exitCode = App.run(new String[] {
+            "--path",
+            "samples/logs/access-2025-03-01.log",
+            "--output-format",
+            format,
+            "--output-path",
+            "report." + format
+        });
+
+        assertThat(exitCode).isEqualTo(2);
     }
 
     @Test
-    @Disabled("MR1: реализуй тест и удали эту строку")
     @DisplayName("--from больше или равен --to -> exit code 2")
     void fromNotBeforeToExitsWithTwo() {
-        fail("Тест не реализован");
+        int exitCode = App.run(new String[] {
+            "--path", "samples/logs/access-2025-03-01.log",
+            "--output-format", "json",
+            "--output-path", "report.json",
+            "--from", "2025-03-02",
+            "--to", "2025-03-01"
+        });
+
+        assertThat(exitCode).isEqualTo(2);
     }
 
     @Test
-    @Disabled("MR1: реализуй тест и удали эту строку")
     @DisplayName("Несуществующий локальный файл -> exit code 2")
     void missingLocalFileExitsWithTwo() {
-        fail("Тест не реализован");
+        int exitCode = App.run(new String[] {
+            "--path", "samples/logs/does-not-exist.log",
+            "--output-format", "json",
+            "--output-path", "report.json"
+        });
+
+        assertThat(exitCode).isEqualTo(2);
     }
 
     @Test
-    @Disabled("MR1: реализуй тест и удали эту строку")
     @DisplayName("Расширение файла отчёта не соответствует формату -> exit code 2")
     void outputExtensionMismatchExitsWithTwo() {
-        fail("Тест не реализован");
+        int exitCode = App.run(new String[] {
+            "--path", "samples/logs/access-2025-03-01.log",
+            "--output-format", "json",
+            "--output-path", "report.md"
+        });
+
+        assertThat(exitCode).isEqualTo(2);
     }
 }
