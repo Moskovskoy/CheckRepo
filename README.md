@@ -191,10 +191,144 @@ python3 -m http.server 8000 --bind 127.0.0.1 --directory samples/logs
 ./gradlew run --args="--path samples/logs/access-2025-03-01.log --output-format json --output-path r.md"  # 2
 ```
 
+## Что реализовано в MR2
+
+MR2 закрывает парсер строки, фильтр по датам и сбор статистики. Отчёты и вывод в файл — в MR3.
+
+### Парсер
+
+Строка лога разбирается регуляркой **той же формы, что валидирует сэмплы в `TemplateSmokeTest`**:
+
+```text
+^(\S+) - (\S+) \[([^\]]+)] "(\S+) (\S+) (\S+)" (\d{3}) (\d+) "([^"]*)" "([^"]*)"$
+```
+
+Из неё в `LogRecord` (record) попадают: `remoteAddr`, `remoteUser`, `timeLocal`, `method`, `resource`, `protocol`, `status`, `bodyBytesSent`, `httpReferer`, `httpUserAgent`. Поля `"$request"` разбиваются на **три отдельных поля** — `method`, `resource`, `protocol`. `remoteUser = "-"` нормализуется в `null`.
+
+`timeLocal` парсится как `ZonedDateTime` (`dd/MMM/yyyy:HH:mm:ss Z`, `Locale.ENGLISH`), чтобы сохранить offset. Для фильтра и статистики доступен `LogRecord.date()` → `LocalDate`.
+
+**Два независимых вида поломки**, оба описаны в `samples/logs/README.md`:
+
+1. **структурная** — строка не подходит под regex (пустая, произвольный текст, обрезанная, `$status` не число, пустой `$request`);
+2. **семантическая** — строка под regex подходит, но `$time_local` не парсится (`[НЕ-ДАТА]`).
+
+Обе возвращают `Optional.empty()` из `LogParser.parse`. Парсер **не бросает исключений и не пишет WARN сам** — это делает `App.execute`, который видит `Optional.empty()` и логирует `skipped malformed log line`. Разделение ответственности: тесты парсера не завязаны на формат лога, тесты CLI проверяют end-to-end поведение.
+
+### Фильтр по датам
+
+`DateFilter.of(from, to) → Predicate<LogRecord>`:
+
+| `--from` | `--to` | Что остаётся |
+|---|---|---|
+| нет | нет | всё |
+| задан | нет | `date >= from` |
+| нет | задан | `date <= to` |
+| задан | задан | `from <= date <= to` |
+
+Границы **включительные** с обеих сторон (TASK: «период включительно»). Сравнивается `LogRecord.date()` (`LocalDate`), offset не учитывается — на сэмплах проекта это корректно, потому что весь лог в `+0000`.
+
+### Статистика
+
+`StatisticsCollector.collect(Stream<LogRecord>)` возвращает `Statistics`:
+
+```text
+Statistics
+├── totalRequests      long
+├── responseCodes      Map<Integer, Long>  // TreeMap, ключи по возрастанию
+├── resources          List<ResourceCount> // top-10, по убыванию count, тай-брейк — лексикографически
+└── responseSizeInBytes ResponseSizeStats
+    ├── average        double  // округлено до 2 знаков
+    ├── max            long
+    └── p95            long
+```
+
+`ResourceCount` — record `(String resource, long count)`.
+
+**Метод p95 — nearest rank.** Отсортировать размеры по возрастанию, взять элемент с индексом `ceil(0.95 * n) - 1` (0-based). Формула одной строкой:
+
+```java
+long p95 = sizes[(int) Math.ceil(0.95 * sizes.length) - 1];
+```
+
+На полном наборе `access-2025-03-0*.log` (`n = 3000`) это даёт `5450` — совпадает с таблицей в `samples/logs/README.md`. Линейная интерполяция дала бы `5450.20`; nearest rank выбран потому, что возвращает `long` без дробной части и воспроизводим одной строкой на любом размере выборки. Покрыт тестом `p95MethodIsDocumentedAndStable`.
+
+`average` округляется через `Math.round(x * 100.0) / 100.0`. `max` и `p95` — целые `long`. На пустом наборе все три равны `0`.
+
+`responseCodes` — `TreeMap`, чтобы порядок ключей был детерминирован (в MR3 это даст стабильный JSON/Markdown). `resources` — `TreeMap` → сортировка по `count` вниз, тай-брейк по имени вверх, `limit(10)`.
+
+### Как это связано с CLI
+
+В MR2 `--from` / `--to` уже влияют на результат, но `--output-format` / `--output-path` **по-прежнему необязательны и ни на что не влияют** — отчёта в файл или stdout ещё нет. Сводка статистики пишется в лог (`stderr` через Logback):
+
+```text
+INFO  a.i.App - Read 3000 records from 1 source(s); top resource /api/v1/accounts (581); avg 2363.94, max 10891, p95 5450
+```
+
+Это осознанно: `stdout` в MR3 станет каналом отчёта, и мешать туда отладочный вывод нельзя. Логи уже настроены в `logback.xml` → `System.err` ещё в MR1.
+
+### Архитектура (дополнения)
+
+```text
+model/        LogRecord (record)
+parser/       LogParser
+filter/       DateFilter
+stats/        Statistics, ResourceCount, ResponseSizeStats, StatisticsCollector
+```
+
+`App.execute` в MR2:
+
+```text
+lines → parse (Optional) → WARN on empty → filter(DateFilter) → StatisticsCollector.collect → LOG.info summary
+```
+
+Стрим остаётся ленивым до `toList()` внутри `StatisticsCollector` — материализация нужна только для `p95` (требует сортировки). На 3000 строк это копейки; TASK прямо разрешает не делать «идеально точный streaming p95 для огромных данных».
+
+### Что сознательно не сделано в MR2
+
+- JSON/Markdown-отчёты, запись в файл, защита от перезаписи, вывод отчёта в stdout — MR3;
+- бонусы (adoc, дни недели, сравнение периодов, названия HTTP-кодов, уникальные протоколы) — после MR3;
+- точный streaming p95 для гигабайтных логов — TASK явно выносит за скобки.
+
+### Проверка MR2
+
+```bash
+./gradlew spotlessApply
+./gradlew test --tests 'academy.incidentradar.mandatory.mr2.*'
+./gradlew check
+```
+
+Ожидаемо: `LogParsingTest` (3 метода), `DateFilterTest` (4), `StatisticsTest` (5) — зелёные; тесты MR3 остаются `@Disabled`.
+
+Ручная проверка на сэмплах:
+
+```bash
+# Полный набор: total = 3000, top = /api/v1/accounts (581), avg = 2363.94, max = 10891, p95 = 5450
+./gradlew run --args="--path 'samples/logs/access-*.log'"
+
+# Только второй день: total = 1500
+./gradlew run --args="--path 'samples/logs/access-*.log' --from 2025-03-02"
+
+# Один день: total = 1500 (границы включительные)
+./gradlew run --args="--path 'samples/logs/access-*.log' --to 2025-03-01"
+
+# Битые строки: 6 WARN + total = 7, exit 0
+./gradlew run --args="--path samples/logs/malformed.log"
+
+# Эталоны из samples/logs/README.md
+./gradlew run --args="--path samples/logs/reference-codes.log"   # 200:2, 404:1, 500:3
+./gradlew run --args="--path samples/logs/reference-sizes.log"   # avg 300.0, max 500, p95 500
+```
+
+Коды возврата в MR2 не меняются — те же `0/1/2`, что и в MR1.
+
 ### Решения, которые стоит зафиксировать
 
-**p95 в MR2 будет считаться методом nearest rank.** Формула: отсортировать размеры по возрастанию, взять элемент с индексом `ceil(0.95 * n) - 1` (0-based). На сэмплах проекта это даёт `5450`, что совпадает с таблицей в `samples/logs/README.md`. Линейная интерполяция дала бы `5450.20`; выбран nearest rank, потому что он не требует дробных значений и воспроизводим на любом размере выборки одной строкой. Метод будет покрыт тестом `p95MethodIsDocumentedAndStable` в MR2.
+**p95 считается методом nearest rank.** Формула: отсортировать размеры по возрастанию, взять элемент с индексом `ceil(0.95 * n) - 1` (0-based). На сэмплах проекта это даёт `5450`, что совпадает с таблицей в `samples/logs/README.md`. Линейная интерполяция дала бы `5450.20`; выбран nearest rank, потому что он не требует дробных значений и воспроизводим на любом размере выборки одной строкой. Метод покрыт тестом `p95MethodIsDocumentedAndStable` в MR2 и описан в javadoc `ResponseSizeStats`.
 
-**Glob матчится по относительному пути.** Причина — нестабильность абсолютных `glob:`-паттернов на Windows. Это записано в комментарии к `LogSourceResolver.resolveGlob`.
+**Парсер возвращает `Optional`, а не бросает.** Причина — `samples/logs/README.md` фиксирует два независимых вида поломки: структурную (regex не подошёл) и семантическую (regex подошёл, дата не парсится). Оба дают `Optional.empty()`, и оба обрабатываются одинаково — WARN и пропуск. Если бы парсер бросал `InternalException`, «ожидаемый сценарий» из TASK превращался бы в падение процесса на середине гигабайтного файла. WARN пишет `App.execute` — это позволяет тестировать парсер на строках, не проверяя формат лога, а тестировать CLI end-to-end на `malformed.log`.
 
-**URL проверяется на этапе чтения, а не в валидаторе.** `UrlLogSource.lines()` делает `send`, получает статус и бросает `UsageException` на 4xx/5xx. Это даёт exit 2 на 404 без отдельного HEAD-запроса. Минус — сетевой запрос происходит в момент чтения, а не валидации; для MR1 это нормально, тест `remote404ExitsWithTwo` проходит.
+**`StatisticsCollector` материализует записи.** `p95` требует сортировки размеров, поэтому стрим вычитывается в `List<LogRecord>` (или `long[]` для размеров). На 3000 строк это неощутимо, TASK прямо разрешает не делать идеально точный streaming p95. Если в бонусах появится сценарий с гигабайтными логами, это место — кандидат на замену на t-digest или reservoir sampling, но для MR2 overkill.
+
+**Glob матчится по относительному пути.** Причина — нестабильность абсолютных `glob:`-паттернов на Windows. Это записано в комментарии к `LogSourceResolver.resolveGlob`. (Решение из MR1.)
+
+**URL проверяется на этапе чтения, а не в валидаторе.** `UrlLogSource.lines()` делает `send`, получает статус и бросает `UsageException` на 4xx/5xx. Это даёт exit 2 на 404 без отдельного HEAD-запроса. Минус — сетевой запрос происходит в момент чтения, а не валидации; для MR1–MR2 это нормально, тест `remote404ExitsWithTwo` проходит. (Решение из MR1.)
